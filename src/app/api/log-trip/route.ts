@@ -1,36 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { parseVoiceInput } from '@/lib/claude';
 import { appendTripRow } from '@/lib/sheets';
-import type { LogTripRequest, LogTripResponse } from '@/types/trip';
+import type { LogTripRequest, LogTripResponse, ParsedTrip } from '@/types/trip';
 
 export async function POST(
   request: NextRequest
 ): Promise<NextResponse<LogTripResponse>> {
   try {
     const body: LogTripRequest = await request.json();
-    const { voice_text, trip_type } = body;
+    const { start_miles, end_miles, trip_type, date, notes } = body;
 
-    if (
-      !voice_text ||
-      typeof voice_text !== 'string' ||
-      voice_text.trim().length === 0
-    ) {
-      return NextResponse.json(
-        { success: false, error: 'Voice text is required' },
-        { status: 400 }
-      );
-    }
     if (trip_type !== 'business' && trip_type !== 'personal') {
       return NextResponse.json(
         { success: false, error: 'trip_type must be "business" or "personal"' },
         { status: 400 }
       );
     }
+    if (!Number.isFinite(start_miles) || !Number.isFinite(end_miles)) {
+      return NextResponse.json(
+        { success: false, error: 'start_miles and end_miles must be numbers' },
+        { status: 400 }
+      );
+    }
+    if (end_miles < start_miles) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: `End miles (${end_miles}) can't be less than start miles (${start_miles})`,
+        },
+        { status: 400 }
+      );
+    }
 
-    // Use server-side date so the log is always in UTC
-    const todayDate = new Date().toISOString().split('T')[0];
-
-    const trip = await parseVoiceInput(voice_text, trip_type, todayDate);
+    const trip: ParsedTrip = { start_miles, end_miles, trip_type, date, notes };
     await appendTripRow(trip);
 
     return NextResponse.json({ success: true, trip });

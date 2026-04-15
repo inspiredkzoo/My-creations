@@ -1,9 +1,14 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import type { TripType, ParsedTrip } from '@/types/trip';
+import type { TripType, ActiveTrip, ParsedTrip } from '@/types/trip';
 
-type AppState = 'idle' | 'recording' | 'processing' | 'success' | 'error';
+// Which phase the user is in
+type Phase = 'start' | 'in-trip' | 'success';
+// State of the microphone within a phase
+type MicState = 'idle' | 'recording' | 'processing' | 'error';
+
+const STORAGE_KEY = 'mileageTracker_activeTrip';
 
 // Web Speech API type declarations (not included in standard DOM types)
 interface SpeechRecognitionEvent extends Event {
@@ -44,28 +49,45 @@ declare global {
 }
 
 export default function HomePage() {
+  const [phase, setPhase] = useState<Phase>('start');
   const [tripType, setTripType] = useState<TripType>('business');
-  const [appState, setAppState] = useState<AppState>('idle');
-  const [transcript, setTranscript] = useState('');
-  const [lastTrip, setLastTrip] = useState<ParsedTrip | null>(null);
+  const [micState, setMicState] = useState<MicState>('idle');
+  const [activeTrip, setActiveTrip] = useState<ActiveTrip | null>(null);
+  const [completedTrip, setCompletedTrip] = useState<ParsedTrip | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const appStateRef = useRef<AppState>('idle');
 
-  // Keep ref in sync so event handlers always see the latest state
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const micStateRef = useRef<MicState>('idle');
+
+  // Keep ref in sync so speech event handlers always see current state
   useEffect(() => {
-    appStateRef.current = appState;
-  }, [appState]);
+    micStateRef.current = micState;
+  }, [micState]);
+
+  // Restore any in-progress trip from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const trip: ActiveTrip = JSON.parse(saved);
+        setActiveTrip(trip);
+        setTripType(trip.trip_type);
+        setPhase('in-trip');
+      }
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  }, []);
 
   // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      recognitionRef.current?.abort();
-    };
+    return () => recognitionRef.current?.abort();
   }, []);
 
-  function startRecording() {
-    if (appStateRef.current !== 'idle') return;
+  // ── Voice helpers ────────────────────────────────────────────────────────
+
+  function startRecording(onResult: (text: string) => void) {
+    if (micStateRef.current !== 'idle') return;
 
     const SpeechRecognitionClass =
       window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -74,7 +96,7 @@ export default function HomePage() {
       setErrorMessage(
         'Voice input is not supported in this browser. Please use Chrome or Safari.'
       );
-      setAppState('error');
+      setMicState('error');
       return;
     }
 
@@ -84,12 +106,11 @@ export default function HomePage() {
     recognition.lang = 'en-US';
     recognitionRef.current = recognition;
 
-    recognition.onstart = () => setAppState('recording');
+    recognition.onstart = () => setMicState('recording');
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
       const text = event.results[0][0].transcript;
-      setTranscript(text);
-      submitTrip(text);
+      onResult(text);
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -102,13 +123,11 @@ export default function HomePage() {
       } else {
         setErrorMessage(`Microphone error: ${event.error}`);
       }
-      setAppState('error');
+      setMicState('error');
     };
 
     recognition.onend = () => {
-      if (appStateRef.current === 'recording') {
-        setAppState('idle');
-      }
+      if (micStateRef.current === 'recording') setMicState('idle');
     };
 
     recognition.start();
@@ -118,37 +137,171 @@ export default function HomePage() {
     recognitionRef.current?.stop();
   }
 
-  async function submitTrip(text: string) {
-    setAppState('processing');
+  function clearError() {
+    setErrorMessage('');
+    setMicState('idle');
+  }
+
+  // ── Phase 1: Start trip ──────────────────────────────────────────────────
+
+  function handleStartMicDown() {
+    startRecording(handleStartMiles);
+  }
+
+  async function handleStartMiles(text: string) {
+    setMicState('processing');
     try {
-      const res = await fetch('/api/log-trip', {
+      const res = await fetch('/api/parse-miles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voice_text: text, trip_type: tripType }),
+        body: JSON.stringify({ voice_text: text }),
       });
       const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error ?? 'Failed to log trip');
-      }
-      setLastTrip(data.trip);
-      setAppState('success');
+      if (!res.ok || !data.success) throw new Error(data.error ?? 'Failed to read miles');
+
+      const todayDate = new Date().toISOString().split('T')[0];
+      const trip: ActiveTrip = {
+        trip_type: tripType,
+        start_miles: data.miles as number,
+        start_date: todayDate,
+        notes: (data.notes as string) ?? '',
+      };
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(trip));
+      setActiveTrip(trip);
+      setPhase('in-trip');
+      setMicState('idle');
     } catch (err) {
       setErrorMessage(
         err instanceof Error ? err.message : 'Something went wrong. Please try again.'
       );
-      setAppState('error');
+      setMicState('error');
     }
   }
 
-  function reset() {
-    setAppState('idle');
-    setTranscript('');
+  // ── Phase 2: End trip ────────────────────────────────────────────────────
+
+  function handleEndMicDown() {
+    startRecording(handleEndMiles);
+  }
+
+  async function handleEndMiles(text: string) {
+    if (!activeTrip) return;
+    setMicState('processing');
+    try {
+      // Parse ending odometer
+      const parseRes = await fetch('/api/parse-miles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voice_text: text }),
+      });
+      const parseData = await parseRes.json();
+      if (!parseRes.ok || !parseData.success)
+        throw new Error(parseData.error ?? 'Failed to read miles');
+
+      const endMiles = parseData.miles as number;
+      const endNotes = (parseData.notes as string) ?? '';
+
+      // Combine notes from start and end (if both exist)
+      const combinedNotes = [activeTrip.notes, endNotes]
+        .filter(Boolean)
+        .join(' — ');
+
+      // Write the completed trip to Google Sheets
+      const logRes = await fetch('/api/log-trip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          start_miles: activeTrip.start_miles,
+          end_miles: endMiles,
+          trip_type: activeTrip.trip_type,
+          date: activeTrip.start_date,
+          notes: combinedNotes,
+        }),
+      });
+      const logData = await logRes.json();
+      if (!logRes.ok || !logData.success)
+        throw new Error(logData.error ?? 'Failed to save trip');
+
+      localStorage.removeItem(STORAGE_KEY);
+      setActiveTrip(null);
+      setCompletedTrip(logData.trip as ParsedTrip);
+      setPhase('success');
+      setMicState('idle');
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Something went wrong. Please try again.'
+      );
+      setMicState('error');
+    }
+  }
+
+  function cancelTrip() {
+    localStorage.removeItem(STORAGE_KEY);
+    setActiveTrip(null);
+    setPhase('start');
+    setMicState('idle');
     setErrorMessage('');
   }
 
-  const isIdle = appState === 'idle';
-  const isRecording = appState === 'recording';
-  const isProcessing = appState === 'processing';
+  function startNewTrip() {
+    setCompletedTrip(null);
+    setPhase('start');
+    setMicState('idle');
+    setErrorMessage('');
+  }
+
+  // ── Render helpers ───────────────────────────────────────────────────────
+
+  const isRecording = micState === 'recording';
+  const isProcessing = micState === 'processing';
+  const isMicBusy = isRecording || isProcessing;
+
+  function MicButton({
+    onDown,
+    label,
+    color = 'blue',
+  }: {
+    onDown: () => void;
+    label: string;
+    color?: 'blue' | 'green';
+  }) {
+    const baseColor =
+      color === 'green'
+        ? 'bg-green-600 hover:bg-green-700 shadow-green-300'
+        : 'bg-blue-600 hover:bg-blue-700 shadow-blue-300';
+
+    return (
+      <div className="flex flex-col items-center gap-3">
+        <button
+          onPointerDown={onDown}
+          onPointerUp={stopRecording}
+          onPointerLeave={stopRecording}
+          disabled={isProcessing}
+          className={`w-36 h-36 rounded-full text-white text-6xl shadow-xl
+            transition-all select-none touch-none
+            ${
+              isRecording
+                ? 'bg-red-500 animate-pulse scale-110 shadow-red-300'
+                : baseColor
+            }
+            disabled:opacity-50 disabled:cursor-not-allowed`}
+          aria-label={isRecording ? 'Release to stop' : label}
+        >
+          🎤
+        </button>
+        <p className="text-center text-gray-500 text-sm">
+          {isRecording
+            ? 'Listening… release when done'
+            : isProcessing
+            ? 'Processing…'
+            : label}
+        </p>
+      </div>
+    );
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center p-5 gap-7 max-w-sm mx-auto">
@@ -158,86 +311,145 @@ export default function HomePage() {
         <p className="text-gray-500 text-sm mt-1">Voice-powered trip log</p>
       </div>
 
-      {/* Trip Type Toggle — only show when not in result/error state */}
-      {(isIdle || isRecording || isProcessing) && (
-        <div className="flex w-full rounded-2xl overflow-hidden border-2 border-blue-600 shadow-sm">
-          {(['business', 'personal'] as TripType[]).map((type) => (
-            <button
-              key={type}
-              onClick={() => setTripType(type)}
-              disabled={isRecording || isProcessing}
-              className={`flex-1 py-4 text-lg font-semibold capitalize transition-colors
-                ${
-                  tripType === type
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white text-blue-600 hover:bg-blue-50'
-                }
-                disabled:opacity-50 disabled:cursor-not-allowed`}
-            >
-              {type === 'business' ? '💼 Business' : '🏠 Personal'}
-            </button>
-          ))}
-        </div>
-      )}
+      {/* ── PHASE: Start trip ── */}
+      {phase === 'start' && (
+        <>
+          {/* Trip type toggle */}
+          <div className="flex w-full rounded-2xl overflow-hidden border-2 border-blue-600 shadow-sm">
+            {(['business', 'personal'] as TripType[]).map((type) => (
+              <button
+                key={type}
+                onClick={() => setTripType(type)}
+                disabled={isMicBusy}
+                className={`flex-1 py-4 text-lg font-semibold capitalize transition-colors
+                  ${
+                    tripType === type
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white text-blue-600 hover:bg-blue-50'
+                  }
+                  disabled:opacity-50 disabled:cursor-not-allowed`}
+              >
+                {type === 'business' ? '💼 Business' : '🏠 Personal'}
+              </button>
+            ))}
+          </div>
 
-      {/* Mic Button */}
-      {(isIdle || isRecording) && (
-        <div className="flex flex-col items-center gap-3">
-          <button
-            onPointerDown={startRecording}
-            onPointerUp={stopRecording}
-            onPointerLeave={stopRecording}
-            className={`w-36 h-36 rounded-full text-white text-6xl shadow-xl
-              transition-all active:scale-95 select-none touch-none
-              ${
-                isRecording
-                  ? 'bg-red-500 animate-pulse scale-110 shadow-red-300'
-                  : 'bg-blue-600 hover:bg-blue-700 shadow-blue-300'
-              }`}
-            aria-label={
-              isRecording
-                ? 'Release to stop recording'
-                : 'Hold to record your trip'
-            }
-          >
-            🎤
-          </button>
-          <p className="text-center text-gray-500 text-sm">
-            {isRecording
-              ? 'Listening… release when done'
-              : 'Hold the mic and speak your trip'}
-          </p>
-        </div>
-      )}
+          {/* Mic button */}
+          {micState !== 'error' && (
+            <MicButton onDown={handleStartMicDown} label="Hold to speak starting miles" />
+          )}
 
-      {/* What to say hint */}
-      {isIdle && (
-        <div className="w-full bg-blue-50 rounded-2xl p-4 border border-blue-100">
-          <p className="text-blue-800 text-sm font-medium mb-1">What to say:</p>
-          <p className="text-blue-700 text-sm italic">
-            "Started at 45,231 ended at 45,412 client meeting downtown"
-          </p>
-          <p className="text-blue-600 text-xs mt-2 opacity-75">
-            Date is optional — today's date is used if you don't say one.
-          </p>
-        </div>
-      )}
-
-      {/* Processing Spinner */}
-      {isProcessing && (
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-14 h-14 rounded-full border-4 border-blue-200 border-t-blue-600 animate-spin" />
-          <p className="text-gray-500 text-sm">Logging your trip…</p>
-          {transcript && (
-            <div className="w-full bg-gray-100 rounded-xl p-3 text-sm text-gray-600 italic">
-              "{transcript}"
+          {/* Hint */}
+          {micState === 'idle' && (
+            <div className="w-full bg-blue-50 rounded-2xl p-4 border border-blue-100">
+              <p className="text-blue-800 text-sm font-medium mb-1">What to say:</p>
+              <p className="text-blue-700 text-sm italic">"45,231"</p>
+              <p className="text-blue-700 text-sm italic mt-1">
+                "45,231 — heading to client meeting"
+              </p>
             </div>
           )}
-        </div>
+
+          {/* Processing spinner */}
+          {isProcessing && (
+            <div className="w-10 h-10 rounded-full border-4 border-blue-200 border-t-blue-600 animate-spin" />
+          )}
+
+          {/* Error */}
+          {micState === 'error' && (
+            <div className="w-full bg-red-50 border border-red-200 rounded-2xl p-5 space-y-3">
+              <p className="text-red-700 font-semibold">⚠️ Could not read miles</p>
+              <p className="text-sm text-red-600">{errorMessage}</p>
+              <button
+                onClick={clearError}
+                className="w-full py-3 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 transition"
+              >
+                Try Again
+              </button>
+            </div>
+          )}
+        </>
       )}
 
-      {/* Success Card */}
-      {appState === 'success' && lastTrip && (
+      {/* ── PHASE: Trip in progress ── */}
+      {phase === 'in-trip' && activeTrip && (
+        <>
+          {/* Active trip banner */}
+          <div className="w-full bg-amber-50 border-2 border-amber-400 rounded-2xl p-4 space-y-2">
+            <p className="text-amber-800 font-bold text-lg">Trip in progress</p>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+              <span className="text-gray-500">Type</span>
+              <span className="font-medium">
+                {activeTrip.trip_type === 'business' ? '💼 Business' : '🏠 Personal'}
+              </span>
+              <span className="text-gray-500">Started</span>
+              <span className="font-medium">{activeTrip.start_date}</span>
+              <span className="text-gray-500">Odometer</span>
+              <span className="font-medium">
+                {activeTrip.start_miles.toLocaleString()} mi
+              </span>
+              {activeTrip.notes && (
+                <>
+                  <span className="text-gray-500">Notes</span>
+                  <span className="font-medium">{activeTrip.notes}</span>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* End trip mic */}
+          {micState !== 'error' && (
+            <MicButton
+              onDown={handleEndMicDown}
+              label="Hold to speak ending miles"
+              color="green"
+            />
+          )}
+
+          {/* Hint */}
+          {micState === 'idle' && (
+            <div className="w-full bg-green-50 rounded-2xl p-4 border border-green-100">
+              <p className="text-green-800 text-sm font-medium mb-1">What to say:</p>
+              <p className="text-green-700 text-sm italic">"45,412"</p>
+              <p className="text-green-700 text-sm italic mt-1">
+                "45,412 — picked up parts at warehouse"
+              </p>
+            </div>
+          )}
+
+          {/* Processing spinner */}
+          {isProcessing && (
+            <div className="w-10 h-10 rounded-full border-4 border-green-200 border-t-green-600 animate-spin" />
+          )}
+
+          {/* Error */}
+          {micState === 'error' && (
+            <div className="w-full bg-red-50 border border-red-200 rounded-2xl p-5 space-y-3">
+              <p className="text-red-700 font-semibold">⚠️ Could not read miles</p>
+              <p className="text-sm text-red-600">{errorMessage}</p>
+              <button
+                onClick={clearError}
+                className="w-full py-3 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 transition"
+              >
+                Try Again
+              </button>
+            </div>
+          )}
+
+          {/* Cancel trip */}
+          {micState === 'idle' && (
+            <button
+              onClick={cancelTrip}
+              className="text-sm text-gray-400 underline hover:text-gray-600 transition"
+            >
+              Cancel this trip
+            </button>
+          )}
+        </>
+      )}
+
+      {/* ── PHASE: Success ── */}
+      {phase === 'success' && completedTrip && (
         <div className="w-full bg-green-50 border border-green-200 rounded-2xl p-5 space-y-4">
           <div className="flex items-center gap-2 text-green-700 font-bold text-xl">
             <span>✅</span>
@@ -246,58 +458,44 @@ export default function HomePage() {
 
           <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
             <span className="text-gray-500">Date</span>
-            <span className="font-medium">{lastTrip.date}</span>
+            <span className="font-medium">{completedTrip.date}</span>
 
             <span className="text-gray-500">Type</span>
-            <span className="font-medium capitalize">
-              {lastTrip.trip_type === 'business' ? '💼 Business' : '🏠 Personal'}
+            <span className="font-medium">
+              {completedTrip.trip_type === 'business' ? '💼 Business' : '🏠 Personal'}
             </span>
 
             <span className="text-gray-500">Start</span>
             <span className="font-medium">
-              {lastTrip.start_miles.toLocaleString()} mi
+              {completedTrip.start_miles.toLocaleString()} mi
             </span>
 
             <span className="text-gray-500">End</span>
             <span className="font-medium">
-              {lastTrip.end_miles.toLocaleString()} mi
+              {completedTrip.end_miles.toLocaleString()} mi
             </span>
 
             <span className="text-gray-500">Distance</span>
             <span className="font-bold text-blue-700 text-base">
-              {(lastTrip.end_miles - lastTrip.start_miles).toLocaleString()} mi
+              {(
+                completedTrip.end_miles - completedTrip.start_miles
+              ).toLocaleString()}{' '}
+              mi
             </span>
 
-            {lastTrip.notes && (
+            {completedTrip.notes && (
               <>
                 <span className="text-gray-500">Notes</span>
-                <span className="font-medium">{lastTrip.notes}</span>
+                <span className="font-medium">{completedTrip.notes}</span>
               </>
             )}
           </div>
 
           <button
-            onClick={reset}
+            onClick={startNewTrip}
             className="w-full py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 active:scale-95 transition"
           >
-            Log Another Trip
-          </button>
-        </div>
-      )}
-
-      {/* Error Card */}
-      {appState === 'error' && (
-        <div className="w-full bg-red-50 border border-red-200 rounded-2xl p-5 space-y-4">
-          <div className="flex items-center gap-2 text-red-700 font-bold text-lg">
-            <span>⚠️</span>
-            <span>Something went wrong</span>
-          </div>
-          <p className="text-sm text-red-600">{errorMessage}</p>
-          <button
-            onClick={reset}
-            className="w-full py-3 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 active:scale-95 transition"
-          >
-            Try Again
+            Start New Trip
           </button>
         </div>
       )}
